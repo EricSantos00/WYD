@@ -1,5 +1,7 @@
 ﻿using Microsoft.Extensions.Logging;
 using System.Buffers;
+using System.Buffers.Binary;
+using System.IO.Pipelines;
 using System.Net.Sockets;
 
 namespace WYD.Network;
@@ -9,15 +11,18 @@ public sealed class Session : ISession
     private readonly Socket _socket;
     private readonly IProtocol _protocol;
     private readonly ILogger<Session> _logger;
-    private readonly ArrayPool<byte> _bufferPool = ArrayPool<byte>.Shared;
-    private byte[] _receiveBuffer;
-    
+
+    private readonly PipeWriter _pipeWriter;
+    private readonly PipeReader _pipeReader;
+
     public Session(Socket socket, IProtocol protocol, ILoggerFactory loggerFactory)
     {
         _socket = socket;
         _protocol = protocol;
         _logger = loggerFactory.CreateLogger<Session>();
-        _receiveBuffer = _bufferPool.Rent(256);
+
+        _pipeWriter = PipeWriter.Create(new NetworkStream(_socket));
+        _pipeReader = PipeReader.Create(new NetworkStream(_socket));
     }
 
     public async Task RunAsync()
@@ -26,7 +31,7 @@ public sealed class Session : ISession
         {
             if (!await ParseHandshakeAsync())
             {
-                _logger.LogInformation("Invalid handshake received. Closing session.");
+                _logger.LogInformation("Invalid handshake received. Closing session");
                 return;
             }
 
@@ -57,11 +62,6 @@ public sealed class Session : ISession
 
         _socket.Close();
 
-        if (_receiveBuffer is not null)
-        {
-            _bufferPool.Return(_receiveBuffer);
-        }
-
         await _protocol.OnDisconnectedAsync(this);
     }
 
@@ -70,68 +70,129 @@ public sealed class Session : ISession
         while (true)
         {
             var packetBuffer = await ReadPacketAsync();
-
+            var payload = new ReadOnlyMemory<byte>(packetBuffer);
             // TODO: Decrypt packet
+
+            // TODO: process packet
+
+            ArrayPool<byte>.Shared.Return(packetBuffer);
         }
     }
 
     private async Task<bool> ParseHandshakeAsync()
     {
-        const int HandshakeLength = 4;
-        const uint HandshakeCode = 0x1F11F311;
+        const uint handshakeCode = 0x1F11F311;
+        var receivedHandshakeToken = await ReceiveHandshakeAsync();
+        return receivedHandshakeToken == handshakeCode;
+    }
 
-        await ReceiveAsync(HandshakeLength);
+    private async Task<uint> ReceiveHandshakeAsync()
+    {
+        var result = await _pipeReader.ReadAsync();
+        var buffer = result.Buffer;
+        const int handshakeSize = 4;
 
-        var handshake = BitConverter.ToUInt32(_receiveBuffer, 0);
-        return handshake == HandshakeCode;
+        // Loop until we have the handshake size
+        while (buffer.Length < handshakeSize)
+        {
+            _pipeReader.AdvanceTo(buffer.Start, buffer.End);
+
+            // Not enough data, read more
+            result = await _pipeReader.ReadAsync();
+            MaybeThrowEndOfStream(result, buffer);
+            buffer = result.Buffer;
+        }
+
+        var handshakeToken = ReadUInt32(buffer);
+        // Advance the buffer
+        buffer = buffer.Slice(handshakeSize);
+
+        _pipeReader.AdvanceTo(buffer.Start);
+        return handshakeToken;
     }
 
     private async Task<byte[]> ReadPacketAsync()
     {
-        const int HeaderLength = 2;
-        const int MinimumPacketSize = 12;
+        var result = await _pipeReader.ReadAsync();
+        var buffer = result.Buffer;
 
-        await ReceiveAsync(HeaderLength);
+        MaybeThrowEndOfStream(result, buffer);
 
-        var packetSize = BitConverter.ToUInt16(_receiveBuffer, 0);
-        if (packetSize < MinimumPacketSize)
+        byte[] readBuffer = [];
+        while (!TryParsePacket(ref buffer, ref readBuffer))
         {
-            throw new InvalidOperationException("Packet size is smaller than the minimum packet size");
+            _pipeReader.AdvanceTo(buffer.Start, buffer.End);
+
+            // Not enough data, read more
+            result = await _pipeReader.ReadAsync();
+            MaybeThrowEndOfStream(result, buffer);
+            buffer = result.Buffer;
         }
 
-        await ReceiveAsync(packetSize - HeaderLength, offset: HeaderLength);
-
-        var packetBuffer = new byte[packetSize];
-        Buffer.BlockCopy(_receiveBuffer, 0, packetBuffer, 0, packetSize);
-
-        return packetBuffer;
+        _pipeReader.AdvanceTo(buffer.Start);
+        return readBuffer;
     }
 
-    private async Task ReceiveAsync(int size, int offset = 0)
+    // This should be wrapped on a different class, where it will manage the rented buffer to avoid mistakes
+    private static bool TryParsePacket(ref ReadOnlySequence<byte> buffer, ref byte[] readBuffer)
     {
-        EnsureBufferCapacity(size);
-
-        int totalBytesReceived = 0;
-
-        while (totalBytesReceived < size)
+        const int packetSizeLength = 2;
+        // At least the packet size
+        if (buffer.Length < packetSizeLength)
         {
-            var bytesReceived = await _socket.ReceiveAsync(new ArraySegment<byte>(_receiveBuffer, offset + totalBytesReceived, size - totalBytesReceived));
-            if (bytesReceived == 0)
-            {
-                throw new InvalidOperationException("Socket closed or error occurred during receive");
-            }
-
-            totalBytesReceived += bytesReceived;
+            return false;
         }
+
+        var packetSize = ReadUInt16(buffer);
+        if (buffer.Length < packetSize)
+        {
+            return false;
+        }
+
+        var sizeToRead = packetSize - packetSizeLength;
+        readBuffer = ArrayPool<byte>.Shared.Rent(sizeToRead);
+
+        var framePayload = buffer.Slice(packetSizeLength, sizeToRead);
+        framePayload.CopyTo(readBuffer);
+
+        // Advance the buffer
+        buffer = buffer.Slice(packetSize);
+        return true;
     }
 
-    private void EnsureBufferCapacity(int size)
+    // This should be on a utility class 
+    private static ushort ReadUInt16(ReadOnlySequence<byte> buffer)
     {
-        if (_receiveBuffer.Length < size)
-        {
-            _bufferPool.Return(_receiveBuffer);
+        // First, we try to get the value from the first span
+        // This is correct, and it's part of the guidance on how to use span
+        if (BinaryPrimitives.TryReadUInt16LittleEndian(buffer.First.Span, out var value))
+            return value;
 
-            _receiveBuffer = _bufferPool.Rent(size);
+        // If we couldn't get from the first span only, we need to make a slice from the sequence
+        Span<byte> bytes = stackalloc byte[2];
+        buffer.Slice(0, 2).CopyTo(bytes);
+        value = BinaryPrimitives.ReadUInt16LittleEndian(bytes);
+        return value;
+    }
+
+    private static uint ReadUInt32(ReadOnlySequence<byte> buffer)
+    {
+        // First, we try to get the value from the first span
+        if (BinaryPrimitives.TryReadUInt32LittleEndian(buffer.First.Span, out var value))
+            return value;
+
+        // If we couldn't get from the first span only, we need to make a slice from the sequence
+        Span<byte> bytes = stackalloc byte[4];
+        buffer.Slice(0, 4).CopyTo(bytes);
+        value = BinaryPrimitives.ReadUInt32LittleEndian(bytes);
+        return value;
+    }
+
+    private static void MaybeThrowEndOfStream(ReadResult result, ReadOnlySequence<byte> buffer)
+    {
+        if (result.IsCompleted && buffer.IsEmpty)
+        {
+            throw new EndOfStreamException("Pipe is completed");
         }
     }
 }
